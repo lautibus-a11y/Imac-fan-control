@@ -1,0 +1,29 @@
+{
+  "ActiveProfileId": "profile_normal",
+  "StartWithWindows": false,
+  "MinimizeToTray": true,
+  "SensorPollIntervalMs": 1000,
+  "CurveUpdateIntervalMs": 2500,
+  "TemperatureHysteresis": 2.0,
+  "DarkTheme": true,
+  "FanCurveAssignments": {
+    "0": "curve_default_odd",
+    "1": "curve_default_hdd",
+    "2": "curve_default_cpu"
+  },
+  "CustomCurves": [
+    {
+      "Id": "curve_default_cpu",
+      "Name": "CPU Standard Curve",
+      "AssociatedSensorKey": "TC0D",
+      "HysteresisDegrees": 2.0,
+      "Points": [
+        { "Temperature": 40.0, "TargetRpm": 1200 },
+        { "Temperature": 50.0, "TargetRpm": 1400 },
+        { "Temperature": 65.0, "TargetRpm": 1800 },
+        { "Temperature": 75.0, "TargetRpm": 2200 },
+        { "Temperature": 85.0, "TargetRpm": 2600 }
+      ]
+    }
+  ]
+}

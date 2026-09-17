@@ -1,0 +1,18 @@
+## Visual Studio / .NET
+[Bb]in/
+[Oo]bj/
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+## Antigravity / Agent
+.gemini/
