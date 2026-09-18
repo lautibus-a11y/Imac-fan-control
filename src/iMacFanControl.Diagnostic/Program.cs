@@ -8,15 +8,50 @@ using iMacFanControl.Core.Models;
 using iMacFanControl.Core.Services;
 using iMacFanControl.Core.SMC;
 using iMacFanControl.Core.SMC.Drivers;
+using iMacFanControl.Diagnostic.Tray;
 
 namespace iMacFanControl.Diagnostic;
 
 internal class Program
 {
+    [STAThread]
     private static void Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        Console.Title = "iMac Fan Control - Hardware Diagnostic & Controller (Phase 2)";
+        Console.Title = "iMac Fan Control - Hardware Controller & Tray (Phase 2)";
+
+        // Check for autostart installation flags before full initialization
+        if (HasArg(args, "--install-autostart"))
+        {
+            if (AutoStartManager.EnableAutoStart(out string msg))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"SUCCESS: {msg}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"FAILED: {msg}");
+            }
+            Console.ResetColor();
+            return;
+        }
+
+        if (HasArg(args, "--uninstall-autostart"))
+        {
+            if (AutoStartManager.DisableAutoStart(out string msg))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"SUCCESS: {msg}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"FAILED: {msg}");
+            }
+            Console.ResetColor();
+            return;
+        }
 
         PrintHeader();
 
@@ -25,6 +60,7 @@ internal class Program
         bool dumpKeys = HasArg(args, "--dump");
         bool interactiveMode = HasArg(args, "--interactive") || HasArg(args, "-i");
         bool restoreAuto = HasArg(args, "--auto");
+        bool trayMode = HasArg(args, "--tray") || HasArg(args, "-t");
         string? profileArg = GetArgValue(args, "--profile") ?? GetArgValue(args, "-p");
         bool hasSetFan = GetSetFanArgs(args, out int targetFanIndex, out int targetRpm);
 
@@ -76,6 +112,15 @@ internal class Program
             }
         }
 
+        // Handle Tray Mode: run background monitor with tray icon
+        if (trayMode)
+        {
+            using var trayController = new SystemTrayController(smcService, fanControlService, profileService, safetyService);
+            trayController.Run();
+            smcService.Close();
+            return;
+        }
+
         // Handle specific CLI actions if provided
         if (hasSetFan)
         {
@@ -100,7 +145,7 @@ internal class Program
 
         if (interactiveMode)
         {
-            RunInteractiveMenu(smcService, fanControlService, profileService);
+            RunInteractiveMenu(smcService, fanControlService, profileService, safetyService);
             smcService.Close();
             return;
         }
@@ -119,15 +164,18 @@ internal class Program
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("--- AVAILABLE COMMANDS ---");
             Console.ResetColor();
+            Console.WriteLine("  --tray / -t              Run minimized in Windows System Tray (next to clock)");
             Console.WriteLine("  --interactive / -i       Open interactive fan control menu");
             Console.WriteLine("  --set-fan <index> <rpm>  Set manual RPM for a fan (e.g. --set-fan 1 1800)");
             Console.WriteLine("  --profile <name>         Apply cooling profile (silent | normal | gaming)");
             Console.WriteLine("  --auto                   Restore all fans to native Apple SMC control");
+            Console.WriteLine("  --install-autostart      Register task to start with Windows as Admin");
+            Console.WriteLine("  --uninstall-autostart    Remove task from Windows Task Scheduler");
             Console.WriteLine("  --watch / -w             Monitor live temperatures and RPM in real time");
             Console.WriteLine("  --dump                   Dump all raw SMC registers in hex");
             Console.WriteLine();
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine("Press 'I' to open Interactive Control Menu, or any other key to exit...");
+            Console.WriteLine("Press 'I' for Interactive Menu, 'T' for Tray Mode, or any other key to exit...");
             Console.ResetColor();
 
             try
@@ -136,7 +184,12 @@ internal class Program
                 if (key.Key == ConsoleKey.I)
                 {
                     Console.Clear();
-                    RunInteractiveMenu(smcService, fanControlService, profileService);
+                    RunInteractiveMenu(smcService, fanControlService, profileService, safetyService);
+                }
+                else if (key.Key == ConsoleKey.T)
+                {
+                    using var tray = new SystemTrayController(smcService, fanControlService, profileService, safetyService);
+                    tray.Run();
                 }
             }
             catch { }
@@ -277,7 +330,11 @@ internal class Program
         Console.ResetColor();
     }
 
-    private static void RunInteractiveMenu(SMCService smcService, FanControlService fanControlService, ProfileService profileService)
+    private static void RunInteractiveMenu(
+        SMCService smcService, 
+        FanControlService fanControlService, 
+        ProfileService profileService,
+        SafetyService safetyService)
     {
         bool running = true;
         smcService.UnlockHardwareWriting(SMCWriter.ConfirmationToken);
@@ -293,13 +350,19 @@ internal class Program
             Console.WriteLine("  [3] Aplicar perfil de refrigeración (Silencioso, Normal, Gaming)");
             Console.WriteLine("  [4] Restaurar TODOS los ventiladores a Automático (SMC de fábrica)");
             Console.WriteLine("  [5] Modo Monitor en vivo (pantalla continua)");
-            Console.WriteLine("  [6] Salir");
+            Console.WriteLine("  [6] Minimizar a la bandeja del sistema (--tray)");
+            Console.WriteLine("  [7] Configurar inicio automático con Windows");
+            Console.WriteLine("  [8] Salir");
             Console.ForegroundColor = ConsoleColor.Cyan;
             Console.WriteLine("========================================================================");
             Console.ResetColor();
-            Console.Write("Selecciona una opción [1-6]: ");
+            Console.Write("Selecciona una opción [1-8]: ");
 
             string? choice = Console.ReadLine()?.Trim();
+            if (choice == null)
+            {
+                break;
+            }
             Console.WriteLine();
 
             switch (choice)
@@ -324,15 +387,70 @@ internal class Program
                     RunLiveWatchLoop(smcService);
                     break;
                 case "6":
+                    using (var tray = new SystemTrayController(smcService, fanControlService, profileService, safetyService))
+                    {
+                        tray.Run();
+                    }
+                    running = false;
+                    break;
+                case "7":
+                    PromptAutoStartConfig();
+                    Pause();
+                    break;
+                case "8":
                     running = false;
                     break;
                 default:
                     Console.ForegroundColor = ConsoleColor.Yellow;
-                    Console.WriteLine("Opción no válida. Ingresa un número del 1 al 6.");
+                    Console.WriteLine("Opción no válida. Ingresa un número del 1 al 8.");
                     Console.ResetColor();
                     Pause();
                     break;
             }
+        }
+    }
+
+    private static void PromptAutoStartConfig()
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("[Inicio Automático con Windows]");
+        Console.ResetColor();
+
+        bool isConfigured = AutoStartManager.IsAutoStartConfigured();
+        Console.WriteLine($"Estado actual: {(isConfigured ? "ACTIVADO (Inicia al encender con privilegios elevados)" : "DESACTIVADO")}\n");
+        Console.WriteLine("  [1] Activar inicio automático con Windows (Crea tarea en Task Scheduler)");
+        Console.WriteLine("  [2] Desactivar inicio automático con Windows (Elimina la tarea)");
+        Console.WriteLine("  [3] Volver");
+        Console.Write("\nSelecciona [1-3]: ");
+
+        string? sub = Console.ReadLine()?.Trim();
+        if (sub == "1")
+        {
+            if (AutoStartManager.EnableAutoStart(out string msg))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\nÉXITO: {msg}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\nERROR: {msg}");
+            }
+            Console.ResetColor();
+        }
+        else if (sub == "2")
+        {
+            if (AutoStartManager.DisableAutoStart(out string msg))
+            {
+                Console.ForegroundColor = ConsoleColor.Green;
+                Console.WriteLine($"\nÉXITO: {msg}");
+            }
+            else
+            {
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\nERROR: {msg}");
+            }
+            Console.ResetColor();
         }
     }
 
@@ -397,6 +515,7 @@ internal class Program
 
     private static void Pause()
     {
+        if (Console.IsInputRedirected) return;
         Console.WriteLine("\nPresiona Enter para continuar...");
         try { Console.ReadLine(); } catch { }
     }
