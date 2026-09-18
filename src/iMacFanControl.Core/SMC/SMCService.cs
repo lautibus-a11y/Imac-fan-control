@@ -216,10 +216,34 @@ public class SMCService : ISMCService
         return null;
     }
 
+    public bool IsWriteUnlocked => !_writer.IsSafetyLocked;
+
+    public void UnlockHardwareWriting(string token)
+    {
+        _writer.UnlockForTestingOnly(token);
+    }
+
+    public void LockHardwareWriting()
+    {
+        _writer.LockWriting();
+    }
+
     public bool SetFanTargetRPM(int fanIndex, int targetRpm)
     {
         if (!IsSMCDetected) return false;
-        // In Phase 1, writer will enforce safety lock
+
+        // 1. Switch fan mode to manual override so SMC firmware honors the target speed
+        try
+        {
+            byte[] modeData = SMCWriter.EncodeUi8(0x01);
+            _writer.WriteKey($"F{fanIndex}Md", modeData);
+        }
+        catch
+        {
+            // Some Mac models don't have or require F{i}Md; proceed to set target
+        }
+
+        // 2. Write target RPM in fpe2 format
         byte[] data = SMCWriter.EncodeFpe2(targetRpm);
         return _writer.WriteKey($"F{fanIndex}Tg", data);
     }
@@ -227,7 +251,6 @@ public class SMCService : ISMCService
     public bool SetFanAutoMode(int fanIndex)
     {
         if (!IsSMCDetected) return false;
-        // In Phase 1, writer will enforce safety lock
         byte[] data = SMCWriter.EncodeUi8(0x00);
         return _writer.WriteKey($"F{fanIndex}Md", data);
     }

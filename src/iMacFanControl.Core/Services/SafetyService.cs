@@ -21,6 +21,11 @@ public class SafetyService
     {
         AppDomain.CurrentDomain.ProcessExit += (s, e) => EmergencyRestoreAllFansToAuto("Process exit");
         AppDomain.CurrentDomain.UnhandledException += (s, e) => EmergencyRestoreAllFansToAuto("Unhandled application exception");
+        try
+        {
+            Console.CancelKeyPress += (s, e) => EmergencyRestoreAllFansToAuto("Terminal Ctrl+C interrupt");
+        }
+        catch { }
     }
 
     /// <summary>

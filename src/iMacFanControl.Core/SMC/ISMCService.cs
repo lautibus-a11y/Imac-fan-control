@@ -29,4 +29,8 @@ public interface ISMCService
 
     byte[]? ReadSMCKey(string key, out string dataType);
     bool WriteSMCKey(string key, byte[] data);
+
+    bool IsWriteUnlocked { get; }
+    void UnlockHardwareWriting(string token);
+    void LockHardwareWriting();
 }

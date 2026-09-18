@@ -21,6 +21,8 @@ public class SMCWriter
     /// </summary>
     public bool IsSafetyLocked { get; private set; } = true;
 
+    public const string ConfirmationToken = "PHASE_2_HARDWARE_WRITE_CONFIRMED";
+
     public SMCWriter(ISMCLowLevelDriver driver)
     {
         _driver = driver ?? throw new ArgumentNullException(nameof(driver));
@@ -28,10 +30,15 @@ public class SMCWriter
 
     public void UnlockForTestingOnly(string confirmationToken)
     {
-        if (confirmationToken == "PHASE_2_HARDWARE_WRITE_CONFIRMED")
+        if (confirmationToken == ConfirmationToken)
         {
             IsSafetyLocked = false;
         }
+    }
+
+    public void LockWriting()
+    {
+        IsSafetyLocked = true;
     }
 
     private bool WaitStatus(byte mask, byte expectedValue)

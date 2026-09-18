@@ -17,6 +17,23 @@ public class MockSMCDriver : ISMCLowLevelDriver
     private readonly Queue<byte> _inputBuffer = new();
     private readonly Queue<byte> _outputBuffer = new();
 
+    private class MockFanState
+    {
+        public string Name { get; set; } = string.Empty;
+        public int CurrentRpm { get; set; }
+        public int TargetRpm { get; set; }
+        public int MinRpm { get; set; }
+        public int MaxRpm { get; set; }
+        public byte Mode { get; set; } // 0 = Auto, 1 = Manual
+    }
+
+    private readonly Dictionary<int, MockFanState> _mockFans = new()
+    {
+        [0] = new MockFanState { Name = "ODD Fan", CurrentRpm = 1200, TargetRpm = 1200, MinRpm = 1200, MaxRpm = 3300, Mode = 0 },
+        [1] = new MockFanState { Name = "HDD Fan", CurrentRpm = 1100, TargetRpm = 1100, MinRpm = 1100, MaxRpm = 5500, Mode = 0 },
+        [2] = new MockFanState { Name = "CPU Fan", CurrentRpm = 1200, TargetRpm = 1200, MinRpm = 940, MaxRpm = 2700, Mode = 0 },
+    };
+
     public bool Initialize(out string errorMessage)
     {
         errorMessage = string.Empty;
@@ -56,7 +73,9 @@ public class MockSMCDriver : ISMCLowLevelDriver
             _outputBuffer.Clear();
             _lastCommand = value;
 
-            if (value == SMCKeys.APPLESMC_CMD_READ || value == SMCKeys.APPLESMC_CMD_GET_KEY_INFO)
+            if (value == SMCKeys.APPLESMC_CMD_READ || 
+                value == SMCKeys.APPLESMC_CMD_GET_KEY_INFO || 
+                value == SMCKeys.APPLESMC_CMD_WRITE)
             {
                 _status = SMCKeys.SMC_STATUS_WAITING; // 0x02: waiting for input
             }
@@ -77,17 +96,67 @@ public class MockSMCDriver : ISMCLowLevelDriver
                 RespondMockKeyInfo(key);
                 _status = SMCKeys.SMC_STATUS_READ;
             }
-            else if (_inputBuffer.Count == 5) // 4 key chars + 1 length byte
+            else if (_lastCommand == SMCKeys.APPLESMC_CMD_READ && _inputBuffer.Count == 5)
             {
+                // READ sends 4 bytes (key) + 1 byte (length)
                 byte[] arr = _inputBuffer.ToArray();
                 string key = System.Text.Encoding.ASCII.GetString(arr, 0, 4);
                 byte len = arr[4];
                 RespondMockKey(key, len);
                 _status = SMCKeys.SMC_STATUS_READ;
             }
+            else if (_lastCommand == SMCKeys.APPLESMC_CMD_WRITE && _inputBuffer.Count >= 5)
+            {
+                // WRITE sends: 4 bytes key, 1 byte length (L), then L data bytes
+                byte[] arr = _inputBuffer.ToArray();
+                byte len = arr[4];
+                if (_inputBuffer.Count == 5 + len)
+                {
+                    string key = System.Text.Encoding.ASCII.GetString(arr, 0, 4);
+                    byte[] data = new byte[len];
+                    Array.Copy(arr, 5, data, 0, len);
+                    HandleMockWrite(key, data);
+                    _status = 0x00; // Idle
+                }
+                else
+                {
+                    _status = SMCKeys.SMC_STATUS_WAITING;
+                }
+            }
             else
             {
                 _status = SMCKeys.SMC_STATUS_WAITING;
+            }
+        }
+    }
+
+    private void HandleMockWrite(string key, byte[] data)
+    {
+        // Handle fan target RPM: F{i}Tg
+        if (key.Length == 4 && key.StartsWith("F") && key.EndsWith("Tg") && char.IsDigit(key[1]))
+        {
+            int fanIndex = key[1] - '0';
+            if (_mockFans.TryGetValue(fanIndex, out var fan) && data.Length >= 2)
+            {
+                int rpm = ((data[0] << 8) | data[1]) >> 2;
+                fan.TargetRpm = rpm;
+                fan.CurrentRpm = rpm; // In mock, immediately reflect the new target RPM
+                fan.Mode = 1; // Manual mode
+            }
+        }
+        // Handle fan mode: F{i}Md
+        else if (key.Length == 4 && key.StartsWith("F") && key.EndsWith("Md") && char.IsDigit(key[1]))
+        {
+            int fanIndex = key[1] - '0';
+            if (_mockFans.TryGetValue(fanIndex, out var fan) && data.Length >= 1)
+            {
+                fan.Mode = data[0];
+                if (fan.Mode == 0)
+                {
+                    // Restored to Auto: return to default base speed
+                    fan.TargetRpm = fan.MinRpm;
+                    fan.CurrentRpm = fan.MinRpm;
+                }
             }
         }
     }
@@ -131,6 +200,56 @@ public class MockSMCDriver : ISMCLowLevelDriver
     private void RespondMockKey(string key, byte len)
     {
         _outputBuffer.Clear();
+
+        // Check if key is a fan query
+        if (key.Length == 4 && key.StartsWith("F") && char.IsDigit(key[1]))
+        {
+            int fanIndex = key[1] - '0';
+            if (_mockFans.TryGetValue(fanIndex, out var fan))
+            {
+                string property = key.Substring(2, 2);
+                switch (property)
+                {
+                    case "ID":
+                        byte[] nameBytes = System.Text.Encoding.ASCII.GetBytes(fan.Name.PadRight(16, '\0'));
+                        for (int i = 0; i < Math.Min(len, nameBytes.Length); i++)
+                            _outputBuffer.Enqueue(nameBytes[i]);
+                        return;
+                    case "Ac":
+                    {
+                        int raw = fan.CurrentRpm << 2;
+                        _outputBuffer.Enqueue((byte)((raw >> 8) & 0xFF));
+                        _outputBuffer.Enqueue((byte)(raw & 0xFF));
+                        return;
+                    }
+                    case "Tg":
+                    {
+                        int raw = fan.TargetRpm << 2;
+                        _outputBuffer.Enqueue((byte)((raw >> 8) & 0xFF));
+                        _outputBuffer.Enqueue((byte)(raw & 0xFF));
+                        return;
+                    }
+                    case "Mn":
+                    {
+                        int raw = fan.MinRpm << 2;
+                        _outputBuffer.Enqueue((byte)((raw >> 8) & 0xFF));
+                        _outputBuffer.Enqueue((byte)(raw & 0xFF));
+                        return;
+                    }
+                    case "Mx":
+                    {
+                        int raw = fan.MaxRpm << 2;
+                        _outputBuffer.Enqueue((byte)((raw >> 8) & 0xFF));
+                        _outputBuffer.Enqueue((byte)(raw & 0xFF));
+                        return;
+                    }
+                    case "Md":
+                        _outputBuffer.Enqueue(fan.Mode);
+                        return;
+                }
+            }
+        }
+
         switch (key)
         {
             case "#KEY":
@@ -140,58 +259,7 @@ public class MockSMCDriver : ISMCLowLevelDriver
                 _outputBuffer.Enqueue(0x40); // 320 keys
                 break;
             case "FNum":
-                _outputBuffer.Enqueue(0x03); // 3 fans on iMac Mid 2011
-                break;
-            case "F0ID":
-                foreach (byte b in System.Text.Encoding.ASCII.GetBytes("ODD Fan\0\0\0\0\0\0\0\0\0"))
-                    _outputBuffer.Enqueue(b);
-                break;
-            case "F0Ac":
-            case "F0Tg":
-                _outputBuffer.Enqueue(0x12);
-                _outputBuffer.Enqueue(0xC0); // 1200 RPM in fpe2
-                break;
-            case "F0Mn":
-                _outputBuffer.Enqueue(0x12);
-                _outputBuffer.Enqueue(0xC0); // 1200 RPM
-                break;
-            case "F0Mx":
-                _outputBuffer.Enqueue(0x33);
-                _outputBuffer.Enqueue(0x90); // 3300 RPM
-                break;
-            case "F1ID":
-                foreach (byte b in System.Text.Encoding.ASCII.GetBytes("HDD Fan\0\0\0\0\0\0\0\0\0"))
-                    _outputBuffer.Enqueue(b);
-                break;
-            case "F1Ac":
-            case "F1Tg":
-                _outputBuffer.Enqueue(0x11);
-                _outputBuffer.Enqueue(0x30); // 1100 RPM
-                break;
-            case "F1Mn":
-                _outputBuffer.Enqueue(0x11);
-                _outputBuffer.Enqueue(0x30); // 1100 RPM
-                break;
-            case "F1Mx":
-                _outputBuffer.Enqueue(0x55);
-                _outputBuffer.Enqueue(0xF0); // 5500 RPM
-                break;
-            case "F2ID":
-                foreach (byte b in System.Text.Encoding.ASCII.GetBytes("CPU Fan\0\0\0\0\0\0\0\0\0"))
-                    _outputBuffer.Enqueue(b);
-                break;
-            case "F2Ac":
-            case "F2Tg":
-                _outputBuffer.Enqueue(0x12);
-                _outputBuffer.Enqueue(0xC0); // 1200 RPM
-                break;
-            case "F2Mn":
-                _outputBuffer.Enqueue(0x0E);
-                _outputBuffer.Enqueue(0xB0); // 940 RPM
-                break;
-            case "F2Mx":
-                _outputBuffer.Enqueue(0x2A);
-                _outputBuffer.Enqueue(0x30); // 2700 RPM
+                _outputBuffer.Enqueue((byte)_mockFans.Count); // 3 fans on iMac Mid 2011
                 break;
 
             // Thermal Sensors (sp78 format: int8 integer part, uint8 fraction part)

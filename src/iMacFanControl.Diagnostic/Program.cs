@@ -16,13 +16,17 @@ internal class Program
     private static void Main(string[] args)
     {
         Console.OutputEncoding = System.Text.Encoding.UTF8;
-        Console.Title = "iMac Fan Control - Hardware Diagnostic (Phase 1)";
+        Console.Title = "iMac Fan Control - Hardware Diagnostic & Controller (Phase 2)";
 
         PrintHeader();
 
         bool useMock = HasArg(args, "--mock");
         bool watchMode = HasArg(args, "--watch") || HasArg(args, "-w");
         bool dumpKeys = HasArg(args, "--dump");
+        bool interactiveMode = HasArg(args, "--interactive") || HasArg(args, "-i");
+        bool restoreAuto = HasArg(args, "--auto");
+        string? profileArg = GetArgValue(args, "--profile") ?? GetArgValue(args, "-p");
+        bool hasSetFan = GetSetFanArgs(args, out int targetFanIndex, out int targetRpm);
 
         // 1. Operating System & Admin Privilege Check
         CheckPlatformAndPrivileges(useMock);
@@ -35,6 +39,9 @@ internal class Program
         // 3. Select and Initialize SMC Driver
         ISMCLowLevelDriver driver = SelectDriver(useMock);
         var smcService = new SMCService(driver);
+        var safetyService = new SafetyService(smcService);
+        var fanControlService = new FanControlService(smcService, safetyService);
+        var profileService = new ProfileService();
 
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine("\n[1/3] Initializing SMC Communication Layer...");
@@ -69,6 +76,35 @@ internal class Program
             }
         }
 
+        // Handle specific CLI actions if provided
+        if (hasSetFan)
+        {
+            ExecuteSetFan(smcService, fanControlService, targetFanIndex, targetRpm);
+            smcService.Close();
+            return;
+        }
+
+        if (restoreAuto)
+        {
+            ExecuteRestoreAuto(smcService, fanControlService);
+            smcService.Close();
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(profileArg))
+        {
+            ExecuteApplyProfile(smcService, fanControlService, profileService, profileArg);
+            smcService.Close();
+            return;
+        }
+
+        if (interactiveMode)
+        {
+            RunInteractiveMenu(smcService, fanControlService, profileService);
+            smcService.Close();
+            return;
+        }
+
         // 4. Run Diagnostic Query
         RunDiagnosticScan(smcService, dumpKeys);
 
@@ -80,23 +116,297 @@ internal class Program
         else
         {
             Console.WriteLine();
-            Console.ForegroundColor = ConsoleColor.DarkCyan;
-            Console.WriteLine("Tip: Run with '--watch' for live updating view, or '--dump' for raw SMC key dump.");
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("--- AVAILABLE COMMANDS ---");
             Console.ResetColor();
-            Console.WriteLine("Phase 1 Diagnostic Complete. SMC writing remains locked.");
-            Console.WriteLine("Press any key to exit...");
-            try { Console.ReadKey(); } catch { }
+            Console.WriteLine("  --interactive / -i       Open interactive fan control menu");
+            Console.WriteLine("  --set-fan <index> <rpm>  Set manual RPM for a fan (e.g. --set-fan 1 1800)");
+            Console.WriteLine("  --profile <name>         Apply cooling profile (silent | normal | gaming)");
+            Console.WriteLine("  --auto                   Restore all fans to native Apple SMC control");
+            Console.WriteLine("  --watch / -w             Monitor live temperatures and RPM in real time");
+            Console.WriteLine("  --dump                   Dump all raw SMC registers in hex");
+            Console.WriteLine();
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine("Press 'I' to open Interactive Control Menu, or any other key to exit...");
+            Console.ResetColor();
+
+            try
+            {
+                var key = Console.ReadKey();
+                if (key.Key == ConsoleKey.I)
+                {
+                    Console.Clear();
+                    RunInteractiveMenu(smcService, fanControlService, profileService);
+                }
+            }
+            catch { }
         }
 
         smcService.Close();
+    }
+
+    private static void ExecuteSetFan(SMCService smcService, FanControlService fanControlService, int fanIndex, int targetRpm)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n[Action: Set Fan Speed]");
+        Console.ResetColor();
+
+        var fans = smcService.GetFans();
+        if (fanIndex < 0 || fanIndex >= fans.Count)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error: Invalid fan index {fanIndex}. Detected {fans.Count} fans (0 to {fans.Count - 1}).");
+            Console.ResetColor();
+            return;
+        }
+
+        var fan = fans[fanIndex];
+        int min = fan.MinRpm > 0 ? fan.MinRpm : 1000;
+        int max = fan.MaxRpm > 0 ? fan.MaxRpm : 5500;
+        int clampedRpm = SafetyService.ClampRpm(targetRpm, min, max);
+
+        if (clampedRpm != targetRpm)
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"Notice: Requested {targetRpm} RPM clamped to safe hardware range [{min} - {max} RPM] -> {clampedRpm} RPM.");
+            Console.ResetColor();
+        }
+
+        // Unlock SMC writing
+        smcService.UnlockHardwareWriting(SMCWriter.ConfirmationToken);
+
+        Console.Write($"Setting {fan.Name} [Index {fanIndex}] to {clampedRpm} RPM... ");
+        bool success = fanControlService.SetFanManualRpm(fanIndex, clampedRpm);
+
+        if (success)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("SUCCESS");
+            Console.ResetColor();
+            Console.WriteLine($"Mode changed to Manual. Target set to {clampedRpm} RPM.");
+            int? updatedCurrent = smcService.GetFanCurrentRPM(fanIndex);
+            if (updatedCurrent.HasValue)
+            {
+                Console.WriteLine($"Current physical speed: {updatedCurrent.Value} RPM");
+            }
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("FAILED");
+            Console.ResetColor();
+            Console.WriteLine("Could not write target RPM to SMC register.");
+        }
+    }
+
+    private static void ExecuteRestoreAuto(SMCService smcService, FanControlService fanControlService)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n[Action: Restore Apple SMC Auto Control]");
+        Console.ResetColor();
+
+        smcService.UnlockHardwareWriting(SMCWriter.ConfirmationToken);
+        bool success = fanControlService.RestoreAllToAuto();
+
+        if (success)
+        {
+            Console.ForegroundColor = ConsoleColor.Green;
+            Console.WriteLine("SUCCESS: All fans restored to factory Apple SMC automatic control.");
+            Console.ResetColor();
+        }
+        else
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("FAILED: Could not restore one or more fans to auto mode.");
+            Console.ResetColor();
+        }
+    }
+
+    private static void ExecuteApplyProfile(SMCService smcService, FanControlService fanControlService, ProfileService profileService, string profileName)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"\n[Action: Apply Cooling Profile '{profileName}']");
+        Console.ResetColor();
+
+        var fans = smcService.GetFans();
+        var profiles = profileService.GetBuiltInProfiles(fans);
+
+        CoolingProfile? matched = null;
+        foreach (var p in profiles)
+        {
+            if (p.Name.Contains(profileName, StringComparison.OrdinalIgnoreCase) ||
+                p.Id.Contains(profileName, StringComparison.OrdinalIgnoreCase))
+            {
+                matched = p;
+                break;
+            }
+        }
+
+        if (matched == null)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Unknown profile '{profileName}'. Available profiles:");
+            foreach (var p in profiles)
+                Console.WriteLine($"  - {p.Name} ({p.Id})");
+            Console.ResetColor();
+            return;
+        }
+
+        smcService.UnlockHardwareWriting(SMCWriter.ConfirmationToken);
+        Console.WriteLine($"Applying '{matched.Name}' ({matched.Description})...\n");
+
+        foreach (var fan in fans)
+        {
+            if (matched.FanModes.TryGetValue(fan.Index, out var mode))
+            {
+                if (mode == FanControlMode.Auto)
+                {
+                    fanControlService.RestoreFanToAuto(fan.Index);
+                    Console.WriteLine($"  {fan.Name,-15}: Restored to Auto");
+                }
+                else if (matched.ManualRpms.TryGetValue(fan.Index, out int targetRpm))
+                {
+                    fanControlService.SetFanManualRpm(fan.Index, targetRpm);
+                    Console.WriteLine($"  {fan.Name,-15}: Set to {targetRpm} RPM (Manual)");
+                }
+            }
+        }
+
+        Console.ForegroundColor = ConsoleColor.Green;
+        Console.WriteLine($"\nProfile '{matched.Name}' applied successfully.");
+        Console.ResetColor();
+    }
+
+    private static void RunInteractiveMenu(SMCService smcService, FanControlService fanControlService, ProfileService profileService)
+    {
+        bool running = true;
+        smcService.UnlockHardwareWriting(SMCWriter.ConfirmationToken);
+
+        while (running)
+        {
+            PrintHeader();
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("======================= INTERACTIVE CONTROL MENU =======================");
+            Console.ResetColor();
+            Console.WriteLine("  [1] Ver estado actual (RPM y temperaturas en vivo)");
+            Console.WriteLine("  [2] Ajustar velocidad manual de un ventilador");
+            Console.WriteLine("  [3] Aplicar perfil de refrigeración (Silencioso, Normal, Gaming)");
+            Console.WriteLine("  [4] Restaurar TODOS los ventiladores a Automático (SMC de fábrica)");
+            Console.WriteLine("  [5] Modo Monitor en vivo (pantalla continua)");
+            Console.WriteLine("  [6] Salir");
+            Console.ForegroundColor = ConsoleColor.Cyan;
+            Console.WriteLine("========================================================================");
+            Console.ResetColor();
+            Console.Write("Selecciona una opción [1-6]: ");
+
+            string? choice = Console.ReadLine()?.Trim();
+            Console.WriteLine();
+
+            switch (choice)
+            {
+                case "1":
+                    RunDiagnosticScan(smcService, false);
+                    Pause();
+                    break;
+                case "2":
+                    PromptSetFanManual(smcService, fanControlService);
+                    Pause();
+                    break;
+                case "3":
+                    PromptApplyProfile(smcService, fanControlService, profileService);
+                    Pause();
+                    break;
+                case "4":
+                    ExecuteRestoreAuto(smcService, fanControlService);
+                    Pause();
+                    break;
+                case "5":
+                    RunLiveWatchLoop(smcService);
+                    break;
+                case "6":
+                    running = false;
+                    break;
+                default:
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine("Opción no válida. Ingresa un número del 1 al 6.");
+                    Console.ResetColor();
+                    Pause();
+                    break;
+            }
+        }
+    }
+
+    private static void PromptSetFanManual(SMCService smcService, FanControlService fanControlService)
+    {
+        var fans = smcService.GetFans();
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("Ventiladores disponibles:");
+        Console.ResetColor();
+        foreach (var fan in fans)
+        {
+            Console.WriteLine($"  [{fan.Index}] {fan.Name} - Actual: {fan.CurrentRpm} RPM (Rango seguro: {fan.MinRpm} - {fan.MaxRpm} RPM)");
+        }
+
+        Console.Write("\nIngresa el índice del ventilador: ");
+        if (!int.TryParse(Console.ReadLine(), out int index) || index < 0 || index >= fans.Count)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Índice de ventilador no válido.");
+            Console.ResetColor();
+            return;
+        }
+
+        var selected = fans[index];
+        Console.Write($"Ingresa las RPM deseadas para '{selected.Name}' [{selected.MinRpm} - {selected.MaxRpm}]: ");
+        if (!int.TryParse(Console.ReadLine(), out int rpm))
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Valor de RPM no válido.");
+            Console.ResetColor();
+            return;
+        }
+
+        ExecuteSetFan(smcService, fanControlService, index, rpm);
+    }
+
+    private static void PromptApplyProfile(SMCService smcService, FanControlService fanControlService, ProfileService profileService)
+    {
+        var fans = smcService.GetFans();
+        var profiles = profileService.GetBuiltInProfiles(fans);
+
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine("Perfiles disponibles:");
+        Console.ResetColor();
+        for (int i = 0; i < profiles.Count; i++)
+        {
+            Console.WriteLine($"  [{i + 1}] {profiles[i].Name} - {profiles[i].Description}");
+        }
+
+        Console.Write("\nSelecciona el perfil [1-3]: ");
+        if (!int.TryParse(Console.ReadLine(), out int idx) || idx < 1 || idx > profiles.Count)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Opción de perfil no válida.");
+            Console.ResetColor();
+            return;
+        }
+
+        var selectedProfile = profiles[idx - 1];
+        ExecuteApplyProfile(smcService, fanControlService, profileService, selectedProfile.Id);
+    }
+
+    private static void Pause()
+    {
+        Console.WriteLine("\nPresiona Enter para continuar...");
+        try { Console.ReadLine(); } catch { }
     }
 
     private static void PrintHeader()
     {
         Console.ForegroundColor = ConsoleColor.Cyan;
         Console.WriteLine(@"===============================================================================");
-        Console.WriteLine(@"                  iMac Fan Control - Hardware Diagnostic                      ");
-        Console.WriteLine(@"                 Phase 1: SMC Hardware Read & Verification                    ");
+        Console.WriteLine(@"                  iMac Fan Control - Hardware Controller                       ");
+        Console.WriteLine(@"                  Phase 2: Verified SMC Control & Profiles                     ");
         Console.WriteLine(@"===============================================================================");
         Console.ResetColor();
     }
@@ -324,6 +634,35 @@ internal class Program
         {
             if (string.Equals(a, flag, StringComparison.OrdinalIgnoreCase))
                 return true;
+        }
+        return false;
+    }
+
+    private static string? GetArgValue(string[] args, string flag)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], flag, StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                return args[i + 1];
+            }
+        }
+        return null;
+    }
+
+    private static bool GetSetFanArgs(string[] args, out int fanIndex, out int targetRpm)
+    {
+        fanIndex = -1;
+        targetRpm = -1;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (string.Equals(args[i], "--set-fan", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 2 < args.Length && int.TryParse(args[i + 1], out fanIndex) && int.TryParse(args[i + 2], out targetRpm))
+                {
+                    return true;
+                }
+            }
         }
         return false;
     }
