@@ -75,3 +75,18 @@ Phase 1 provides a diagnostic tool to verify real communication with the Apple S
    ```cmd
    iMacFanControl.Diagnostic.exe --dump
    ```
+
+### Building the Windows Installer (.exe)
+
+To generate the standalone Windows installer `iMacFanControl_Setup.exe`:
+
+1. Publish the standalone binaries:
+   ```bash
+   dotnet publish src/iMacFanControl.Diagnostic/iMacFanControl.Diagnostic.csproj -c Release -r win-x64 --self-contained true -o ./publish/windows-x64-standalone
+   ```
+2. Compile the NSIS installer:
+   ```bash
+   cd installer
+   makensis iMacFanControl_installer.nsi
+   ```
+   The installer executable will be generated at `publish/iMacFanControl_Setup.exe`.
